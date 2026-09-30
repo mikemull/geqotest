@@ -1,0 +1,17 @@
+[package]
+name = "geqotest"
+version = "0.1.0"
+edition = "2024"
+description = "Synthetic schema/data generator and benchmark harness for testing PostgreSQL join-order optimization (GEQO vs. exhaustive search)."
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+rand = "0.9"
+rand_distr = "0.5"
+rand_chacha = "0.9"
+postgres = { version = "0.19", features = ["with-serde_json-1"] }
+anyhow = "1"
+csv = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"

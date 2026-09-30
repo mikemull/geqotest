@@ -1,0 +1,208 @@
+mod bench;
+mod cli;
+mod db;
+mod ddl;
+mod generate;
+mod manifest;
+mod queries;
+mod schema;
+mod words;
+
+use anyhow::{Context, Result};
+use cli::{BenchArgs, Cli, Command, GenerateArgs, LoadArgs, RunArgs};
+use clap::Parser;
+use rand::{Rng, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Generate(args) => cmd_generate(&args),
+        Command::Load(args) => cmd_load(&args),
+        Command::Bench(args) => cmd_bench(&args),
+        Command::Run(args) => cmd_run(&args),
+    }
+}
+
+fn cmd_generate(args: &GenerateArgs) -> Result<()> {
+    std::fs::create_dir_all(&args.out_dir)?;
+
+    let seed = args.seed.unwrap_or_else(|| rand::rng().random());
+    let mut rng = ChaCha8Rng::seed_from_u64(seed);
+
+    let sizing = schema::SizingParams {
+        min_rows: args.min_rows,
+        max_rows: args.max_rows,
+        fact_multiplier: args.fact_multiplier,
+    };
+    let built = schema::build_schema(args.schema, args.tables, &sizing, &mut rng);
+
+    println!(
+        "Generating {} tables ({} topology), seed={seed} -> {}",
+        built.tables.len(),
+        built.topology,
+        args.out_dir.display()
+    );
+
+    generate::generate_data(&built, args.skew, seed, &args.out_dir).context("generating table data")?;
+
+    let ddl = ddl::render_ddl(&built, &args.pg_schema);
+    std::fs::write(args.out_dir.join("schema.sql"), &ddl)?;
+
+    let qs = queries::generate_queries(&built, &args.pg_schema, args.filter_selectivity);
+    queries::save_queries(&qs, &args.out_dir)?;
+    let queries_sql: String = qs
+        .iter()
+        .map(|q| format!("-- {} ({} tables): {}\n{}\n\n", q.id, q.num_tables, q.label, q.sql))
+        .collect();
+    std::fs::write(args.out_dir.join("queries.sql"), queries_sql)?;
+
+    let num_tables = built.tables.len();
+    let manifest = manifest::Manifest {
+        schema: built,
+        seed,
+        skew: args.skew,
+        filter_selectivity: args.filter_selectivity,
+        pg_schema: args.pg_schema.clone(),
+        generated_at: chrono::Utc::now().to_rfc3339(),
+    };
+    manifest::save(&manifest, &args.out_dir)?;
+
+    println!(
+        "Wrote schema.sql, queries.sql/json, manifest.json, and {num_tables} table CSVs to {}",
+        args.out_dir.display()
+    );
+    println!(
+        "Postgres' geqo_threshold defaults to 12; with {num_tables} tables, queries joining more \
+         than that many tables will engage GEQO on a default server."
+    );
+    if args.filter_selectivity >= 1.0 {
+        println!(
+            "filter_selectivity=1.0: no WHERE filters were added, so joins stay lossless FK->PK \
+             1:1 and plan cost will likely be near order-invariant. Pass --filter-selectivity \
+             below 1.0 (default 0.1) if you want join order to actually affect cost."
+        );
+    } else {
+        println!(
+            "Each non-fact table in a query gets a WHERE filter passing ~{:.0}% of its rows, so \
+             join order genuinely affects plan cost.",
+            args.filter_selectivity.clamp(0.0, 1.0) * 100.0
+        );
+    }
+    Ok(())
+}
+
+fn cmd_load(args: &LoadArgs) -> Result<()> {
+    let manifest = manifest::load(&args.out_dir).context("run `generate` first")?;
+    let ddl = std::fs::read_to_string(args.out_dir.join("schema.sql"))?;
+    let mut client = db::connect(&args.dsn).context("connecting to Postgres")?;
+
+    println!(
+        "Creating schema `{}`{}...",
+        manifest.pg_schema,
+        if args.recreate { " (recreating)" } else { "" }
+    );
+    db::create_schema(&mut client, &manifest.pg_schema, &ddl, args.recreate)?;
+
+    for table in &manifest.schema.tables {
+        let csv_path = args.out_dir.join("tables").join(format!("{}.csv", table.name));
+        let rows = db::load_table_csv(&mut client, &manifest.pg_schema, &table.name, &csv_path)?;
+        println!("  loaded {rows} rows into {}.{}", manifest.pg_schema, table.name);
+    }
+    println!("Load complete.");
+    Ok(())
+}
+
+fn cmd_bench(args: &BenchArgs) -> Result<()> {
+    let manifest = manifest::load(&args.out_dir).context("run `generate` first")?;
+    let all_queries = queries::load_queries(&args.out_dir).context("run `generate` first")?;
+    let mut client = db::connect(&args.dsn).context("connecting to Postgres")?;
+
+    let server_threshold: i32 = client
+        .query_one("SHOW geqo_threshold", &[])
+        .ok()
+        .and_then(|row| row.try_get::<_, String>(0).ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(12);
+    let effective_threshold = args.geqo_threshold.map(|t| t as i32).unwrap_or(server_threshold);
+
+    let qs: Vec<_> = if args.include_below_threshold {
+        all_queries
+    } else {
+        all_queries
+            .into_iter()
+            .filter(|q| q.num_tables as i32 > effective_threshold)
+            .collect()
+    };
+
+    println!(
+        "Server geqo_threshold = {server_threshold}{}; schema has {} tables; {} of the generated \
+         queries invoke GEQO (> {effective_threshold} tables).",
+        args.geqo_threshold
+            .map(|t| format!(" (overridden to {t} for this run)"))
+            .unwrap_or_default(),
+        manifest.schema.tables.len(),
+        qs.len(),
+    );
+
+    if qs.is_empty() {
+        println!(
+            "No queries exceed the GEQO threshold ({effective_threshold} tables) so there's nothing \
+             to benchmark. Generate with more tables (--tables > {effective_threshold}), pass \
+             --geqo-threshold to lower the threshold, or pass --include-below-threshold to \
+             benchmark the full query ladder anyway."
+        );
+        return Ok(());
+    }
+
+    let max_query_tables = qs.iter().map(|q| q.num_tables).max().unwrap_or(8) as u32;
+    let collapse_limit = args.join_collapse_limit.unwrap_or(max_query_tables);
+    println!(
+        "Using join_collapse_limit = from_collapse_limit = {collapse_limit} (Postgres defaults to \
+         8, which caps how many explicitly-JOINed tables the optimizer will reorder regardless of \
+         geqo_threshold; pass --join-collapse-limit 8 to reproduce that default cap)."
+    );
+
+    let configs = bench::build_configs(args.geqo_threshold, args.repeat, args.geqo_seed);
+    let results = bench::run_bench(&mut client, &manifest.pg_schema, &qs, &configs, args.analyze, collapse_limit)?;
+
+    let results_path = args.out_dir.join(&args.results_file);
+    bench::write_results(&results, &results_path)?;
+    bench::print_summary(&results);
+
+    let comparisons = bench::compute_comparisons(&results);
+    let comparison_path = args.out_dir.join("comparison.csv");
+    bench::write_comparisons(&comparisons, &comparison_path)?;
+    bench::print_comparison_summary(&comparisons);
+
+    println!(
+        "Wrote {} result rows to {} and {} comparison rows to {}",
+        results.len(),
+        results_path.display(),
+        comparisons.len(),
+        comparison_path.display()
+    );
+    Ok(())
+}
+
+fn cmd_run(args: &RunArgs) -> Result<()> {
+    cmd_generate(&args.generate)?;
+
+    cmd_load(&LoadArgs {
+        out_dir: args.generate.out_dir.clone(),
+        dsn: args.dsn.clone(),
+        recreate: args.recreate,
+    })?;
+
+    cmd_bench(&BenchArgs {
+        out_dir: args.generate.out_dir.clone(),
+        dsn: args.dsn.clone(),
+        analyze: args.analyze,
+        geqo_threshold: args.geqo_threshold,
+        include_below_threshold: args.include_below_threshold,
+        repeat: args.repeat,
+        geqo_seed: args.geqo_seed,
+        join_collapse_limit: args.join_collapse_limit,
+        results_file: args.results_file.clone(),
+    })
+}
