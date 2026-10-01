@@ -10,6 +10,13 @@ pub enum Topology {
     /// A star schema where roughly half of the dimensions are further
     /// normalized into a sub-dimension (dim -> subdim), i.e. two join levels.
     Snowflake,
+    /// Every table joins directly to every other table (a complete join
+    /// graph, C(n,2) edges). All tables share one row count so their PK
+    /// domains overlap, making `ti.id = tj.id` valid for every pair. This is
+    /// the hardest case for join-order search: every subset of relations is
+    /// connected, so nothing can be pruned by connectivity alone (see
+    /// Moerkotte & Neumann's DP join-enumeration benchmarks).
+    Clique,
 }
 
 impl std::fmt::Display for Topology {
@@ -18,6 +25,7 @@ impl std::fmt::Display for Topology {
             Topology::Chain => "chain",
             Topology::Star => "star",
             Topology::Snowflake => "snowflake",
+            Topology::Clique => "clique",
         };
         write!(f, "{s}")
     }
@@ -70,6 +78,14 @@ pub struct Table {
     pub pk: String,
     pub columns: Vec<Column>,
     pub foreign_keys: Vec<ForeignKey>,
+    /// Fraction of this table's rows (0.0-1.0) that pass a generated
+    /// `attribute_1 <= threshold` predicate in queries that include it.
+    /// `None` for tables with no `attribute_1` column (fact tables).
+    /// Sampled independently per table from
+    /// `[filter_selectivity_min, filter_selectivity_max]` at schema-build
+    /// time — different tables having different selectivity is what makes
+    /// join order actually change plan cost; see `SizingParams`.
+    pub filter_selectivity: Option<f64>,
 }
 
 impl Table {
@@ -116,6 +132,13 @@ pub struct SizingParams {
     pub min_rows: usize,
     pub max_rows: usize,
     pub fact_multiplier: usize,
+    /// Range each table's filter_selectivity is independently sampled from.
+    /// Equal min/max gives every table the same fixed selectivity (which
+    /// makes plan cost close to order-invariant); a real range gives each
+    /// table its own selectivity, which is what actually rewards a smart
+    /// join order.
+    pub filter_selectivity_min: f64,
+    pub filter_selectivity_max: f64,
 }
 
 /// Build a schema definition (no data yet) for the requested topology.
@@ -135,6 +158,7 @@ pub fn build_schema(
         Topology::Chain => build_chain(num_tables, sizing, rng),
         Topology::Star => build_star(num_tables, sizing, rng),
         Topology::Snowflake => build_snowflake(num_tables, sizing, rng),
+        Topology::Clique => build_clique(num_tables, sizing, rng),
     };
 
     Schema { topology, tables }
@@ -142,6 +166,12 @@ pub fn build_schema(
 
 fn random_row_count(sizing: &SizingParams, rng: &mut impl rand::Rng) -> usize {
     rng.random_range(sizing.min_rows..=sizing.max_rows)
+}
+
+fn random_filter_selectivity(sizing: &SizingParams, rng: &mut impl rand::Rng) -> f64 {
+    let lo = sizing.filter_selectivity_min.min(sizing.filter_selectivity_max);
+    let hi = sizing.filter_selectivity_min.max(sizing.filter_selectivity_max);
+    if (hi - lo).abs() < f64::EPSILON { lo } else { rng.random_range(lo..=hi) }
 }
 
 fn build_chain(num_tables: usize, sizing: &SizingParams, rng: &mut impl rand::Rng) -> Vec<Table> {
@@ -163,6 +193,7 @@ fn build_chain(num_tables: usize, sizing: &SizingParams, rng: &mut impl rand::Rn
             pk: "id".into(),
             columns,
             foreign_keys,
+            filter_selectivity: Some(random_filter_selectivity(sizing, rng)),
         });
     }
     tables
@@ -183,6 +214,7 @@ fn build_star(num_tables: usize, sizing: &SizingParams, rng: &mut impl rand::Rng
             pk: "id".into(),
             columns,
             foreign_keys: Vec::new(),
+            filter_selectivity: Some(random_filter_selectivity(sizing, rng)),
         });
     }
 
@@ -203,6 +235,7 @@ fn build_star(num_tables: usize, sizing: &SizingParams, rng: &mut impl rand::Rng
         pk: "id".into(),
         columns: fact_columns,
         foreign_keys: fact_fks,
+        filter_selectivity: None,
     });
 
     tables
@@ -231,6 +264,7 @@ fn build_snowflake(num_tables: usize, sizing: &SizingParams, rng: &mut impl rand
             pk: "id".into(),
             columns,
             foreign_keys: Vec::new(),
+            filter_selectivity: Some(random_filter_selectivity(sizing, rng)),
         });
     }
 
@@ -252,6 +286,7 @@ fn build_snowflake(num_tables: usize, sizing: &SizingParams, rng: &mut impl rand
             pk: "id".into(),
             columns,
             foreign_keys,
+            filter_selectivity: Some(random_filter_selectivity(sizing, rng)),
         });
     }
 
@@ -277,8 +312,29 @@ fn build_snowflake(num_tables: usize, sizing: &SizingParams, rng: &mut impl rand
         pk: "id".into(),
         columns: fact_columns,
         foreign_keys: fact_fks,
+        filter_selectivity: None,
     });
 
+    tables
+}
+
+fn build_clique(num_tables: usize, sizing: &SizingParams, rng: &mut impl rand::Rng) -> Vec<Table> {
+    // Every table shares one row count so their `id` PK domains overlap
+    // exactly (all are 1..=row_count), making `ti.id = tj.id` a valid,
+    // non-empty join for every pair without needing a separate FK column
+    // per edge — the shared PK column doubles as every pairwise FK.
+    let row_count = random_row_count(sizing, rng);
+    let mut tables = Vec::with_capacity(num_tables);
+    for i in 1..=num_tables {
+        let name = format!("t{i}");
+        let mut columns = vec![Column { name: "id".into(), ty: ColumnType::BigInt }];
+        columns.extend(attribute_columns());
+        let foreign_keys = (1..i)
+            .map(|j| ForeignKey { column: "id".into(), ref_table: format!("t{j}"), ref_column: "id".into() })
+            .collect();
+        let filter_selectivity = Some(random_filter_selectivity(sizing, rng));
+        tables.push(Table { name, row_count, pk: "id".into(), columns, foreign_keys, filter_selectivity });
+    }
     tables
 }
 
@@ -289,7 +345,13 @@ mod tests {
     use rand_chacha::ChaCha8Rng;
 
     fn sizing() -> SizingParams {
-        SizingParams { min_rows: 10, max_rows: 100, fact_multiplier: 5 }
+        SizingParams {
+            min_rows: 10,
+            max_rows: 100,
+            fact_multiplier: 5,
+            filter_selectivity_min: 0.1,
+            filter_selectivity_max: 0.1,
+        }
     }
 
     fn rng() -> ChaCha8Rng {
@@ -313,7 +375,7 @@ mod tests {
 
     #[test]
     fn topologies_produce_requested_table_count_and_valid_dependencies() {
-        for topology in [Topology::Chain, Topology::Star, Topology::Snowflake] {
+        for topology in [Topology::Chain, Topology::Star, Topology::Snowflake, Topology::Clique] {
             for num_tables in [2, 3, 12, 25] {
                 let schema = build_schema(topology, num_tables, &sizing(), &mut rng());
                 assert_eq!(schema.tables.len(), num_tables, "{topology} with {num_tables} tables");
@@ -330,5 +392,50 @@ mod tests {
             let num_dims = schema.tables.iter().filter(|t| t.name.starts_with("dim")).count();
             assert_eq!(fact.foreign_keys.len(), num_dims);
         }
+    }
+
+    #[test]
+    fn clique_has_every_pairwise_edge_and_a_shared_row_count() {
+        let n = 6;
+        let schema = build_schema(Topology::Clique, n, &sizing(), &mut rng());
+
+        let total_edges: usize = schema.tables.iter().map(|t| t.foreign_keys.len()).sum();
+        assert_eq!(total_edges, n * (n - 1) / 2, "clique of {n} tables should have C(n,2) edges");
+
+        let row_counts: std::collections::HashSet<usize> =
+            schema.tables.iter().map(|t| t.row_count).collect();
+        assert_eq!(row_counts.len(), 1, "clique tables must share one row count so PK domains overlap");
+    }
+
+    #[test]
+    fn fact_tables_have_no_filter_selectivity_others_do() {
+        for topology in [Topology::Star, Topology::Snowflake] {
+            let schema = build_schema(topology, 12, &sizing(), &mut rng());
+            assert_eq!(schema.table("fact").filter_selectivity, None);
+            for t in schema.tables.iter().filter(|t| t.name != "fact") {
+                assert!(t.filter_selectivity.is_some(), "{} should have a filter_selectivity", t.name);
+            }
+        }
+        for topology in [Topology::Chain, Topology::Clique] {
+            let schema = build_schema(topology, 8, &sizing(), &mut rng());
+            assert!(schema.tables.iter().all(|t| t.filter_selectivity.is_some()));
+        }
+    }
+
+    #[test]
+    fn per_table_selectivity_varies_within_the_requested_range() {
+        let sizing = SizingParams {
+            min_rows: 10,
+            max_rows: 100,
+            fact_multiplier: 5,
+            filter_selectivity_min: 0.05,
+            filter_selectivity_max: 0.5,
+        };
+        let schema = build_schema(Topology::Chain, 10, &sizing, &mut rng());
+        let values: Vec<f64> = schema.tables.iter().filter_map(|t| t.filter_selectivity).collect();
+        assert!(values.iter().all(|v| (0.05..=0.5).contains(v)), "{values:?}");
+        let distinct: std::collections::BTreeMap<u64, ()> =
+            values.iter().map(|v| ((v * 1e9) as u64, ())).collect();
+        assert!(distinct.len() > 1, "expected per-table variation, got {values:?}");
     }
 }

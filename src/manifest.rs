@@ -1,3 +1,4 @@
+use crate::queries::JoinSyntax;
 use crate::schema::Schema;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -7,7 +8,11 @@ pub struct Manifest {
     pub schema: Schema,
     pub seed: u64,
     pub skew: f64,
-    pub filter_selectivity: f64,
+    /// Generation parameters for filter_selectivity; each table's actual
+    /// sampled value lives on `schema.tables[i].filter_selectivity`.
+    pub filter_selectivity_min: f64,
+    pub filter_selectivity_max: f64,
+    pub join_syntax: JoinSyntax,
     pub pg_schema: String,
     pub generated_at: String,
 }

@@ -24,11 +24,14 @@ pub fn render_ddl(schema: &Schema, pg_schema: &str) -> String {
         out.push_str("\n);\n\n");
     }
 
+    // A constraint name must include the referenced table, not just the
+    // column: a clique schema's `id` column carries one FK per other table,
+    // so `fk_<table>_<column>` alone would collide across those FKs.
     for table in &schema.tables {
         for fk in &table.foreign_keys {
             out.push_str(&format!(
-                "ALTER TABLE {pg_schema}.{} ADD CONSTRAINT fk_{}_{} FOREIGN KEY ({}) REFERENCES {pg_schema}.{}({});\n",
-                table.name, table.name, fk.column, fk.column, fk.ref_table, fk.ref_column
+                "ALTER TABLE {pg_schema}.{} ADD CONSTRAINT fk_{}_{}_{} FOREIGN KEY ({}) REFERENCES {pg_schema}.{}({});\n",
+                table.name, table.name, fk.column, fk.ref_table, fk.column, fk.ref_table, fk.ref_column
             ));
         }
     }
@@ -36,12 +39,17 @@ pub fn render_ddl(schema: &Schema, pg_schema: &str) -> String {
 
     // Postgres does not auto-index FK columns; without these, every join
     // degrades to a sequential scan regardless of what the optimizer picks.
+    // A column can carry more than one FK (again, the clique case), so index
+    // each (table, column) pair once rather than once per FK.
     for table in &schema.tables {
+        let mut indexed_columns = std::collections::BTreeSet::new();
         for fk in &table.foreign_keys {
-            out.push_str(&format!(
-                "CREATE INDEX idx_{}_{} ON {pg_schema}.{}({});\n",
-                table.name, fk.column, table.name, fk.column
-            ));
+            if indexed_columns.insert(fk.column.as_str()) {
+                out.push_str(&format!(
+                    "CREATE INDEX idx_{}_{} ON {pg_schema}.{}({});\n",
+                    table.name, fk.column, table.name, fk.column
+                ));
+            }
         }
     }
 

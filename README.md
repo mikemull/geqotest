@@ -46,6 +46,16 @@ This is equivalent to running `generate`, `load`, and `bench` back to back
   independent dimension tables (`dim1..dimN-1`).
 - **`snowflake`** — a star schema where roughly half the dimensions are
   further normalized: `fact -> dim -> subdim`, a two-level hierarchy.
+- **`clique`** — every table joins directly to every other table (a complete
+  join graph, C(n,2) edges). All tables share one row count so their `id`
+  PK domains overlap exactly, making `ti.id = tj.id` valid for every pair.
+  This is the hardest case for join-order search: chain/star/snowflake are
+  sparse, so most candidate subsets of relations aren't even connected and
+  get pruned for free; in a clique, *every* subset is connected, so the
+  optimizer has to actually cost all of them. (This is the synthetic
+  benchmark shape used in Moerkotte & Neumann's dynamic-programming
+  join-enumeration papers, alongside chain and star, to stress-test search
+  algorithms independent of join size.)
 
 Every FK is child-to-parent-primary-key (an inner-join-only, 1:1 equi-join)
 — see "Why filters matter" below for why this alone isn't enough to make
@@ -60,7 +70,7 @@ the *effective* threshold (the server's, or your `--geqo-threshold`
 override) — pass `--include-below-threshold` to fall back to benchmarking
 every generated query regardless of size.
 
-### Why filters matter (`--filter-selectivity`)
+### Why filters matter (`--filter-selectivity`, `--filter-selectivity-max`)
 
 Every join here is a lossless FK→PK join: joining a fact row to its
 dimension row never changes the row count. With no `WHERE` clause, total
@@ -70,10 +80,20 @@ GEQO explore different join orders (different plans) that all cost the same.
 
 `--filter-selectivity <0.0-1.0>` (default `0.1`) adds a
 `WHERE table.attribute_1 <= threshold` predicate to every non-fact table,
-sized to pass roughly that fraction of rows. This breaks the symmetry so
-join order (and which selective table gets applied first) genuinely affects
-cost. Pass `1.0` to disable filtering and reproduce the "everything ties"
-behavior.
+sized to pass roughly that fraction of rows. Pass `1.0` to disable filtering
+and reproduce the "everything ties" behavior.
+
+**But giving every table the *same* selectivity still leaves cost close to
+order-invariant** — every join shrinks the running row count by the same
+proportion regardless of which table goes first, so there's still little to
+gain from a smarter order. Real predicates (region, date range, status, ...)
+almost never have equal selectivity. Pass `--filter-selectivity-max <f64>`
+to sample each table's selectivity independently and uniformly from
+`[filter-selectivity, filter-selectivity-max]` instead of using a single
+fixed value — this is what actually makes join order change plan cost (and
+makes GEQO's randomized choice of order show up as real cost spread across
+`--repeat` runs, not just differing plan shapes at identical cost). Each
+table's sampled value is recorded on it in `manifest.json`.
 
 ### Explicit `JOIN` vs. comma joins (`--join-syntax`)
 
@@ -125,11 +145,12 @@ geqotest generate \
 | Flag | Default | Meaning |
 |---|---|---|
 | `--tables` | `12` | Number of tables to generate |
-| `--schema` | `star` | `chain` \| `star` \| `snowflake` |
+| `--schema` | `star` | `chain` \| `star` \| `snowflake` \| `clique` |
 | `--min-rows` / `--max-rows` | `1000` / `10000` | Row-count range for dimension/chain tables |
 | `--fact-multiplier` | `20` | Fact rows = largest dimension's rows × this (star/snowflake only) |
 | `--skew` | `1.2` | Zipfian exponent for FK reference skew (`0` = uniform) |
 | `--filter-selectivity` | `0.1` | Fraction of rows passing the generated WHERE filter (`1.0` = off) |
+| `--filter-selectivity-max` | unset (= `--filter-selectivity`) | Upper bound for per-table selectivity variation; each table samples independently from `[filter-selectivity, filter-selectivity-max]` |
 | `--join-syntax` | `explicit` | `explicit` \| `comma` |
 | `--seed` | random | RNG seed (printed every run, for reproducibility) |
 | `--pg-schema` | `geqotest` | Postgres schema/namespace the tables will live under |

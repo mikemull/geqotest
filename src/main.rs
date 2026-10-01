@@ -30,10 +30,13 @@ fn cmd_generate(args: &GenerateArgs) -> Result<()> {
     let seed = args.seed.unwrap_or_else(|| rand::rng().random());
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
 
+    let filter_selectivity_max = args.filter_selectivity_max.unwrap_or(args.filter_selectivity);
     let sizing = schema::SizingParams {
         min_rows: args.min_rows,
         max_rows: args.max_rows,
         fact_multiplier: args.fact_multiplier,
+        filter_selectivity_min: args.filter_selectivity,
+        filter_selectivity_max,
     };
     let built = schema::build_schema(args.schema, args.tables, &sizing, &mut rng);
 
@@ -49,7 +52,7 @@ fn cmd_generate(args: &GenerateArgs) -> Result<()> {
     let ddl = ddl::render_ddl(&built, &args.pg_schema);
     std::fs::write(args.out_dir.join("schema.sql"), &ddl)?;
 
-    let qs = queries::generate_queries(&built, &args.pg_schema, args.filter_selectivity);
+    let qs = queries::generate_queries(&built, &args.pg_schema, args.join_syntax);
     queries::save_queries(&qs, &args.out_dir)?;
     let queries_sql: String = qs
         .iter()
@@ -62,7 +65,9 @@ fn cmd_generate(args: &GenerateArgs) -> Result<()> {
         schema: built,
         seed,
         skew: args.skew,
-        filter_selectivity: args.filter_selectivity,
+        filter_selectivity_min: args.filter_selectivity,
+        filter_selectivity_max,
+        join_syntax: args.join_syntax,
         pg_schema: args.pg_schema.clone(),
         generated_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -76,18 +81,41 @@ fn cmd_generate(args: &GenerateArgs) -> Result<()> {
         "Postgres' geqo_threshold defaults to 12; with {num_tables} tables, queries joining more \
          than that many tables will engage GEQO on a default server."
     );
-    if args.filter_selectivity >= 1.0 {
+    let (sel_min, sel_max) = (args.filter_selectivity.clamp(0.0, 1.0), filter_selectivity_max.clamp(0.0, 1.0));
+    if sel_min >= 1.0 && sel_max >= 1.0 {
         println!(
             "filter_selectivity=1.0: no WHERE filters were added, so joins stay lossless FK->PK \
              1:1 and plan cost will likely be near order-invariant. Pass --filter-selectivity \
              below 1.0 (default 0.1) if you want join order to actually affect cost."
         );
+    } else if (sel_max - sel_min).abs() < f64::EPSILON {
+        println!(
+            "Each non-fact table gets a WHERE filter passing the SAME ~{:.0}% of its rows. Note \
+             that giving every table equal selectivity makes plan cost close to order-invariant \
+             (every join shrinks the running row count by the same proportion); pass \
+             --filter-selectivity-max to vary selectivity per table instead.",
+            sel_min * 100.0
+        );
     } else {
         println!(
-            "Each non-fact table in a query gets a WHERE filter passing ~{:.0}% of its rows, so \
-             join order genuinely affects plan cost.",
-            args.filter_selectivity.clamp(0.0, 1.0) * 100.0
+            "Each non-fact table gets its OWN WHERE filter, independently passing between \
+             ~{:.0}% and ~{:.0}% of its rows — varying selectivity across tables is what makes \
+             join order genuinely change plan cost.",
+            sel_min * 100.0,
+            sel_max * 100.0
         );
+    }
+    match args.join_syntax {
+        queries::JoinSyntax::Explicit => println!(
+            "join_syntax=explicit: queries use JOIN...ON, so Postgres' join_collapse_limit \
+             (default 8) caps how much of the join the optimizer will reorder unless you raise it \
+             with `bench --join-collapse-limit`."
+        ),
+        queries::JoinSyntax::Comma => println!(
+            "join_syntax=comma: queries use a flat FROM a, b, c WHERE ... list, which Postgres \
+             parses with nothing to collapse — the whole join is exposed to the optimizer \
+             unconditionally, so only geqo_threshold decides whether GEQO engages."
+        ),
     }
     Ok(())
 }

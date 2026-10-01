@@ -1,3 +1,4 @@
+use crate::queries::JoinSyntax;
 use crate::schema::Topology;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
@@ -55,12 +56,35 @@ pub struct GenerateArgs {
     pub skew: f64,
 
     /// Fraction of rows (0.0-1.0) that pass a WHERE filter added to every
-    /// non-fact table in each generated query. Without a filter, every join
-    /// here is a lossless FK->PK 1:1 join that preserves row counts, so
-    /// total plan cost ends up nearly invariant to join order and GEQO has
-    /// nothing to meaningfully search for. 1.0 disables filtering.
+    /// non-fact table. Without a filter, every join here is a lossless
+    /// FK->PK 1:1 join that preserves row counts, so total plan cost ends up
+    /// nearly invariant to join order and GEQO has nothing to meaningfully
+    /// search for. 1.0 disables filtering. Used as a fixed value for every
+    /// table unless --filter-selectivity-max is also given.
     #[arg(long, default_value_t = 0.1)]
     pub filter_selectivity: f64,
+
+    /// Upper bound for per-table filter selectivity variation. When given,
+    /// each table's selectivity is drawn independently and uniformly from
+    /// [filter-selectivity, filter-selectivity-max] instead of using
+    /// filter-selectivity as a fixed value for every table. Giving every
+    /// table the *same* selectivity makes plan cost close to order-invariant
+    /// (every join shrinks the running row count by the same proportion
+    /// regardless of order) — varying it per table is what actually rewards
+    /// a smart join order, the way real predicates with different
+    /// selectivities do.
+    #[arg(long)]
+    pub filter_selectivity_max: Option<f64>,
+
+    /// SQL join style to emit. `explicit` (`JOIN ... ON`) is capped by
+    /// Postgres' join_collapse_limit (default 8) unless you raise it at
+    /// bench time (see `bench --join-collapse-limit`). `comma`
+    /// (`FROM a, b, c WHERE ...`) is parsed as an already-flat relation
+    /// list with nothing to collapse, so the whole join is exposed to the
+    /// optimizer unconditionally — only geqo_threshold decides whether
+    /// GEQO engages.
+    #[arg(long, value_enum, default_value_t = JoinSyntax::Explicit)]
+    pub join_syntax: JoinSyntax,
 
     /// RNG seed; omit for a random one (printed on every run for repro).
     #[arg(long)]
