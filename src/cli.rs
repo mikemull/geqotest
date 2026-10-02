@@ -24,6 +24,9 @@ pub enum Command {
     Bench(BenchArgs),
     /// Generate, load, and bench in one step.
     Run(RunArgs),
+    /// Sweep GEQO tuning knobs (geqo_effort, geqo_pool_size, geqo_generations)
+    /// against one query and report the planning-time/cost tradeoff.
+    Sweep(SweepArgs),
 }
 
 #[derive(Args, Clone)]
@@ -213,4 +216,68 @@ pub struct RunArgs {
     /// Results CSV filename, written inside out_dir.
     #[arg(long, default_value = "results.csv")]
     pub results_file: PathBuf,
+}
+
+#[derive(Args, Clone)]
+pub struct SweepArgs {
+    /// Directory previously populated by `generate`.
+    #[arg(long, default_value = "out")]
+    pub out_dir: PathBuf,
+
+    /// Postgres connection string, e.g. postgres://user:pass@localhost/dbname
+    #[arg(long, env = "GEQOTEST_DSN")]
+    pub dsn: String,
+
+    /// Which rung of the generated query ladder to sweep, by its table
+    /// count (e.g. 14 picks the query that joins exactly 14 tables).
+    #[arg(long)]
+    pub num_tables: usize,
+
+    /// geqo_pool_size values to grid over (with --generations), e.g.
+    /// 10,50,200,1000. Omit for a log-spaced default.
+    #[arg(long, value_delimiter = ',')]
+    pub pool_sizes: Option<Vec<u32>>,
+
+    /// geqo_generations values to grid over (with --pool-sizes). Omit for a
+    /// log-spaced default.
+    #[arg(long, value_delimiter = ',')]
+    pub generations: Option<Vec<u32>>,
+
+    /// geqo_effort values (1-10) to sweep independently of pool_size and
+    /// generations — effort auto-derives both of those when they're left at
+    /// their default of 0, so this is how GEQO is tuned in practice before
+    /// reaching for manual pool_size/generations. Omit to sweep all of 1-10.
+    #[arg(long, value_delimiter = ',')]
+    pub efforts: Option<Vec<u32>>,
+
+    /// Samples per setting. GEQO is randomized, so one sample per setting is
+    /// noise; defaults higher than `bench --repeat` since variance *is* the
+    /// thing being measured here.
+    #[arg(long, default_value_t = 5)]
+    pub repeat: usize,
+
+    /// Pin geqo_seed to this value on every sample instead of drawing a
+    /// fresh random one each time.
+    #[arg(long)]
+    pub geqo_seed: Option<f64>,
+
+    /// Use EXPLAIN ANALYZE (actually executes the query on every sample)
+    /// instead of plan-only EXPLAIN. A full sweep runs many EXPLAINs, so
+    /// this can get slow — left off by default.
+    #[arg(long, default_value_t = false)]
+    pub analyze: bool,
+
+    /// Session join_collapse_limit (and from_collapse_limit) to use while
+    /// sweeping. Omit to auto-raise it to the swept query's table count so
+    /// the full join is exposed; pass 8 to reproduce Postgres' default cap.
+    #[arg(long)]
+    pub join_collapse_limit: Option<u32>,
+
+    /// Raw per-run CSV filename, written inside out_dir.
+    #[arg(long, default_value = "sweep_runs.csv")]
+    pub runs_file: PathBuf,
+
+    /// Aggregated per-setting CSV filename, written inside out_dir.
+    #[arg(long, default_value = "sweep_summary.csv")]
+    pub summary_file: PathBuf,
 }

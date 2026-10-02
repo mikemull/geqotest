@@ -197,6 +197,47 @@ geqotest bench \
 `generate` + `load` + `bench` in one step. Takes the union of all their
 flags (see `geqotest run --help`).
 
+### `sweep`
+
+Takes a single query (picked from the generated ladder by its table count)
+and sweeps GEQO's own tuning knobs against it — `geqo_effort`, and a
+`geqo_pool_size` x `geqo_generations` grid — reporting the planning-time/cost
+tradeoff rather than a single number. GEQO is randomized, so every setting is
+sampled `--repeat` times (default 5) with a fresh `geqo_seed`.
+
+```sh
+geqotest sweep \
+  --out-dir out --dsn "$GEQOTEST_DSN" \
+  --num-tables 16 \
+  --repeat 5
+```
+
+Always includes two reference points alongside the sweep: `geqo_off` (true
+exhaustive-search cost — the ceiling on plan quality) and `auto` (GEQO left
+entirely at its own defaults). Output is framed as a **Pareto frontier**:
+for each setting it computes mean/min/max cost and planning time across its
+repeats, then keeps only the settings not dominated by another (i.e. no
+other setting is at least as cheap *and* at least as fast) — this directly
+answers "given I'm willing to spend X ms planning, what's the best cost
+achievable?" instead of making you eyeball a full grid.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--num-tables` | required | Which rung of the query ladder to sweep (its exact table count) |
+| `--pool-sizes` | log-spaced `10..1000` | `geqo_pool_size` values to grid over (comma-separated) |
+| `--generations` | log-spaced `10..1000` | `geqo_generations` values to grid over (comma-separated) |
+| `--efforts` | `1..10` | `geqo_effort` values to sweep independently (effort auto-derives pool_size/generations when they're left at 0 — this is how GEQO is tuned in practice before reaching for manual control) |
+| `--repeat` | `5` | Samples per setting (higher default than `bench`, since variance is the point) |
+| `--geqo-seed` | random per sample | Pin a seed instead of randomizing it |
+| `--join-collapse-limit` | auto (swept query's table count) | Same meaning as `bench` |
+| `--analyze` | off | Use `EXPLAIN ANALYZE`; a full sweep runs many EXPLAINs, so this can get slow |
+| `--runs-file` / `--summary-file` | `sweep_runs.csv` / `sweep_summary.csv` | Output filenames inside `out_dir` |
+
+A full default sweep (7×7 pool/generations cells + 10 effort levels + 2
+references, × 5 repeats) runs a few hundred `EXPLAIN`s — `sweep` prints the
+exact count up front. Narrow `--pool-sizes`/`--generations`/`--efforts` for a
+quicker look.
+
 ## Output files
 
 Written to `--out-dir`:
@@ -210,6 +251,8 @@ Written to `--out-dir`:
 | `manifest.json` | Full schema definition plus the seed/skew/filter/join-syntax/pg-schema used to generate it |
 | `results.csv` | One row per (query, config, repeat): cost, planning time, execution time, plan shape |
 | `comparison.csv` | One row per query: `geqo_off` vs. `geqo_on` (averaged across repeats) for cost, planning time, execution time |
+| `sweep_runs.csv` | From `sweep`: one row per individual EXPLAIN sample (setting, repeat, seed, cost, planning time, plan shape) |
+| `sweep_summary.csv` | From `sweep`: one row per distinct setting, aggregated across its repeats, with a `pareto_optimal` flag |
 
 `bench` also prints:
 - The raw per-row results table, including a `plan` column (a canonicalized

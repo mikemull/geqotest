@@ -6,10 +6,11 @@ mod generate;
 mod manifest;
 mod queries;
 mod schema;
+mod sweep;
 mod words;
 
 use anyhow::{Context, Result};
-use cli::{BenchArgs, Cli, Command, GenerateArgs, LoadArgs, RunArgs};
+use cli::{BenchArgs, Cli, Command, GenerateArgs, LoadArgs, RunArgs, SweepArgs};
 use clap::Parser;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -21,6 +22,7 @@ fn main() -> Result<()> {
         Command::Load(args) => cmd_load(&args),
         Command::Bench(args) => cmd_bench(&args),
         Command::Run(args) => cmd_run(&args),
+        Command::Sweep(args) => cmd_sweep(&args),
     }
 }
 
@@ -233,4 +235,61 @@ fn cmd_run(args: &RunArgs) -> Result<()> {
         join_collapse_limit: args.join_collapse_limit,
         results_file: args.results_file.clone(),
     })
+}
+
+fn cmd_sweep(args: &SweepArgs) -> Result<()> {
+    let manifest = manifest::load(&args.out_dir).context("run `generate` first")?;
+    let all_queries = queries::load_queries(&args.out_dir).context("run `generate` first")?;
+    let query = all_queries
+        .into_iter()
+        .find(|q| q.num_tables == args.num_tables)
+        .with_context(|| {
+            format!(
+                "no generated query joins exactly {} tables — check queries.json for available sizes",
+                args.num_tables
+            )
+        })?;
+
+    let mut client = db::connect(&args.dsn).context("connecting to Postgres")?;
+    let collapse_limit = args.join_collapse_limit.unwrap_or(args.num_tables as u32);
+
+    println!(
+        "Sweeping GEQO tuning for {} ({} tables); join_collapse_limit={collapse_limit}, {} repeat(s) per setting.",
+        query.id, query.num_tables, args.repeat
+    );
+
+    let config = sweep::SweepConfig {
+        pool_sizes: args.pool_sizes.clone().unwrap_or_else(sweep::default_pool_sizes),
+        generations: args.generations.clone().unwrap_or_else(sweep::default_generations),
+        efforts: args.efforts.clone().unwrap_or_else(sweep::default_efforts),
+        repeat: args.repeat,
+        pinned_seed: args.geqo_seed,
+    };
+
+    let grid_cells = config.pool_sizes.len() * config.generations.len();
+    let total_calls = 1 + config.repeat * (1 + config.efforts.len() + grid_cells);
+    println!(
+        "{grid_cells} pool_size x generations cells, {} effort levels, plus references -> {total_calls} \
+         EXPLAIN calls total.",
+        config.efforts.len(),
+    );
+
+    let runs = sweep::run_sweep(&mut client, &manifest.pg_schema, &query.sql, &config, args.analyze, collapse_limit)?;
+
+    let runs_path = args.out_dir.join(&args.runs_file);
+    sweep::write_runs(&runs, &runs_path)?;
+
+    let cells = sweep::aggregate_cells(&runs);
+    let summary_path = args.out_dir.join(&args.summary_file);
+    sweep::write_cells(&cells, &summary_path)?;
+    sweep::print_summary(&cells);
+
+    println!(
+        "Wrote {} raw runs to {} and {} aggregated settings to {}",
+        runs.len(),
+        runs_path.display(),
+        cells.len(),
+        summary_path.display()
+    );
+    Ok(())
 }

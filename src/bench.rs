@@ -133,7 +133,23 @@ fn reset_config(client: &mut Client, config: &GeqoConfig) -> anyhow::Result<()> 
     Ok(())
 }
 
-fn explain_one(client: &mut Client, q: &Query, config_label: &str, analyze: bool) -> anyhow::Result<BenchResult> {
+/// Cost/timing/shape extracted from one `EXPLAIN` run, independent of
+/// whatever query or GEQO config produced it — shared by `bench` and
+/// `sweep` so they don't each reimplement JSON plan parsing.
+#[derive(Debug, Clone)]
+pub struct PlanStats {
+    pub planning_time_ms: f64,
+    pub execution_time_ms: Option<f64>,
+    pub total_cost: f64,
+    /// Canonical `NodeType(child,child,...)` string (relation names at the
+    /// leaves) describing the concrete plan shape/join order chosen — the
+    /// thing that actually varies between GEQO runs, not just the cost.
+    pub plan_signature: String,
+}
+
+/// Run `EXPLAIN` (plan-only, or with `ANALYZE` if `analyze`) on `sql` against
+/// whatever session GUCs the caller has already set, and extract its stats.
+pub fn explain_query(client: &mut Client, sql: &str, analyze: bool) -> anyhow::Result<PlanStats> {
     // SUMMARY true forces "Planning Time" into the JSON even without ANALYZE
     // (by default it's only emitted alongside ANALYZE's execution stats).
     let explain_kw = if analyze {
@@ -141,12 +157,22 @@ fn explain_one(client: &mut Client, q: &Query, config_label: &str, analyze: bool
     } else {
         "EXPLAIN (FORMAT JSON, SUMMARY true)"
     };
-    let sql = format!("{explain_kw} {}", q.sql);
-    let row = client.query_one(&sql, &[])?;
+    let full_sql = format!("{explain_kw} {sql}");
+    let row = client.query_one(&full_sql, &[])?;
     let json: serde_json::Value = row.get(0);
     let top = &json[0];
     let plan = &top["Plan"];
 
+    Ok(PlanStats {
+        planning_time_ms: top["Planning Time"].as_f64().unwrap_or(0.0),
+        execution_time_ms: top.get("Execution Time").and_then(|v| v.as_f64()),
+        total_cost: plan["Total Cost"].as_f64().unwrap_or(0.0),
+        plan_signature: plan_signature(plan),
+    })
+}
+
+fn explain_one(client: &mut Client, q: &Query, config_label: &str, analyze: bool) -> anyhow::Result<BenchResult> {
+    let stats = explain_query(client, &q.sql, analyze)?;
     Ok(BenchResult {
         query_id: q.id.clone(),
         label: q.label.clone(),
@@ -154,10 +180,10 @@ fn explain_one(client: &mut Client, q: &Query, config_label: &str, analyze: bool
         config: config_label.to_string(),
         repeat_index: 0,
         geqo_seed: None,
-        planning_time_ms: top["Planning Time"].as_f64().unwrap_or(0.0),
-        execution_time_ms: top.get("Execution Time").and_then(|v| v.as_f64()),
-        total_cost: plan["Total Cost"].as_f64().unwrap_or(0.0),
-        plan_signature: plan_signature(plan),
+        planning_time_ms: stats.planning_time_ms,
+        execution_time_ms: stats.execution_time_ms,
+        total_cost: stats.total_cost,
+        plan_signature: stats.plan_signature,
     })
 }
 
